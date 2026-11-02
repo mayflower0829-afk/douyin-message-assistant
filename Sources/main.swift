@@ -259,7 +259,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
                 if found[name] == nil {order.append(name)}
                 found[name,default:[]].append(nameNode);lastName = name
             } else if string(node,"AXRole") == "AXStaticText",string(node,"AXValue") == "发消息",let name = lastName {
-                contactOpeners[name] = node
+                contactOpeners[name] = attribute(node,"AXParent").map{$0 as! AXUIElement} ?? node
             }
         }
         contactElements = found
@@ -289,37 +289,36 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     @discardableResult func typeText(_ text:String,to pid:pid_t)->Bool {
         for var units in MessageRules.chunks(text) {
             guard let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true),let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false) else {return false}
+            down.flags = [];up.flags = []
             down.keyboardSetUnicodeString(stringLength:units.count,unicodeString:&units);up.keyboardSetUnicodeString(stringLength:units.count,unicodeString:&units)
             down.postToPid(pid);up.postToPid(pid)
         }
         return true
     }
     func searchInDouyin(_ query:String,token:Int,completion:@escaping ()->Void) {
-        guard let (app,field,_) = searchContext(),let position = point(field) else {finish("请先授权并打开抖音消息面板。");return}
-        NSApp.yieldActivation(to:app);app.activate(options:[.activateAllWindows])
-        let root = AXUIElementCreateApplication(app.processIdentifier)
-        if let window = (attribute(root,"AXWindows") as? [AXUIElement])?.first {AXUIElementPerformAction(window,kAXRaiseAction as CFString)}
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
-            guard let self = self,token == self.generation else {return}
-            var hit:AXUIElement?
-            var hitPID:pid_t = 0
-            let result = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),Float(position.x),Float(position.y),&hit)
-            if let element = hit {AXUIElementGetPid(element,&hitPID)}
-            guard result == .success,hitPID == app.processIdentifier else {self.finish("抖音搜索框被遮挡，请先打开抖音窗口。");return}
-            self.clickPoint(position)
-            DispatchQueue.main.asyncAfter(deadline:.now()+0.15) { [weak self] in
+        guard let (original,_,_) = searchContext(),let url = original.bundleURL else {finish("请先授权并打开抖音消息面板。");return}
+        let config = NSWorkspace.OpenConfiguration();config.activates = true;config.addsToRecentItems = false
+        NSApp.yieldActivation(to:original)
+        NSWorkspace.shared.openApplication(at:url,configuration:config) { [weak self] opened,error in
+            DispatchQueue.main.asyncAfter(deadline:.now()+0.4) {
                 guard let self = self,token == self.generation else {return}
-                let root = AXUIElementCreateApplication(app.processIdentifier)
-                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),CFEqual(focus,field) else {self.finish("搜索框未获得焦点，未输入。");return}
-                let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true);down?.flags = .maskCommand;down?.postToPid(app.processIdentifier)
-                let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.flags = .maskCommand;up?.postToPid(app.processIdentifier)
-                CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:true)?.postToPid(app.processIdentifier)
-                CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:false)?.postToPid(app.processIdentifier)
-                guard self.typeText(query,to:app.processIdentifier) else {self.finish("无法输入搜索内容。");return}
-                DispatchQueue.main.asyncAfter(deadline:.now()+0.8) { [weak self] in
+                guard error == nil,let opened = opened,let (app,field,_) = self.searchContext(),app.processIdentifier == opened.processIdentifier,let position = self.point(field) else {self.finish("无法打开抖音消息面板。");return}
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音已离开前台，停止搜索。");return}
+                self.clickPoint(position)
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in
                     guard let self = self,token == self.generation else {return}
-                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let (_,current,_) = self.searchContext(),string(current,"AXValue") == query else {self.finish("搜索内容已变化，请重新搜索。");return}
-                    completion()
+                    let root = AXUIElementCreateApplication(app.processIdentifier)
+                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),CFEqual(focus,field) else {self.finish("搜索框未获得焦点，未输入。");return}
+                    let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true);down?.flags = .maskCommand;down?.postToPid(app.processIdentifier)
+                    let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.flags = .maskCommand;up?.postToPid(app.processIdentifier)
+                    CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:true)?.postToPid(app.processIdentifier)
+                    CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:false)?.postToPid(app.processIdentifier)
+                    guard self.typeText(query,to:app.processIdentifier) else {self.finish("无法输入搜索内容。");return}
+                    DispatchQueue.main.asyncAfter(deadline:.now()+0.8) { [weak self] in
+                        guard let self = self,token == self.generation else {return}
+                        guard let (_,current,_) = self.searchContext(),string(current,"AXValue") == query else {self.finish("搜索内容已变化，请重新搜索。");return}
+                        completion()
+                    }
                 }
             }
         }
@@ -336,12 +335,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     }
     @objc func loadMore() {
         generation += 1;let token = generation;let old = targetName;setEditing(false)
-        searchInDouyin("",token:token) { [weak self] in
-            guard let self = self,let (app,_,scope) = self.searchContext(),let center = self.point(scope) else {self?.finish("未找到消息列表。");return}
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音已离开前台，停止加载。");return}
-            CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:center,mouseButton:.left)?.post(tap:.cghidEventTap)
-            let wheel = CGEvent(scrollWheelEvent2Source:nil,units:.pixel,wheelCount:1,wheel1:-550,wheel2:0,wheel3:0);wheel?.location = center;wheel?.post(tap:.cghidEventTap)
-            DispatchQueue.main.asyncAfter(deadline:.now()+0.6) { [weak self] in
+        guard let (_,field,scope) = searchContext() else {finish("请先授权并打开抖音消息面板。");return}
+        if !string(field,"AXValue").isEmpty {
+            if let cancel = dfs(scope).first(where:{string($0,"AXRole") == "AXStaticText" && string($0,"AXValue") == "取消"}),let parent = attribute(cancel,"AXParent") {
+                AXUIElementPerformAction(parent as! AXUIElement,kAXPressAction as CFString)
+            } else {AXUIElementSetAttributeValue(field,kAXValueAttribute as CFString,"" as CFString)}
+        }
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { [weak self] in
+            guard let self = self,token == self.generation else {return}
+            guard let (_,current,scope) = self.searchContext(),string(current,"AXValue").isEmpty else {self.finish("请先取消抖音搜索，再加载更多。");return}
+            _ = self.collectContacts(preserving:old)
+            guard let last = self.dfs(scope).last(where:{string($0,"AXRole") == "AXImage" && !string($0,"AXDescription").isEmpty}),AXUIElementPerformAction(last,"AXScrollToVisible" as CFString) == .success else {self.finish("当前列表没有可继续滚动的会话。");return}
+            DispatchQueue.main.asyncAfter(deadline:.now()+0.8) { [weak self] in
                 guard let self = self,token == self.generation else {return}
                 _ = self.collectContacts(preserving:old);self.setEditing(true)
             }
@@ -352,7 +357,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         searchInDouyin(name,token:token) { [weak self] in
             guard let self = self else {return}
             guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleID,self.collectContacts(preserving:name),let matches = self.contactElements[name],matches.count == 1,let position = self.point(self.contactOpeners[name] ?? matches[0]) else {self.targetName = name;self.finish("未找到唯一匹配的联系人，未发送。请搜索并核实同名会话。");return}
-            self.targetName = name;self.clickPoint(position)
+            self.targetName = name
+            if let opener = self.contactOpeners[name] {
+                guard AXUIElementPerformAction(opener,kAXPressAction as CFString) == .success else {self.finish("无法打开所选会话。");return}
+            } else {self.clickPoint(position)}
             DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { [weak self] in guard self?.generation == token else {return};then() }
         }
     }
