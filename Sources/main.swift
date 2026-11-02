@@ -21,8 +21,14 @@ func clean(_ s: String) -> String {
     s.replacingOccurrences(of:"\u{200B}",with:"").trimmingCharacters(in:.whitespacesAndNewlines)
 }
 
-final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     var window: NSWindow!
+    let searchField = NSSearchField()
+    let searchButton = NSButton(title:"搜索抖音",target:nil,action:nil)
+    let moreButton = NSButton(title:"加载更多",target:nil,action:nil)
+    var knownNames = [String]()
+    var flow: SendFlow?
+
     let isPreview = CommandLine.arguments.contains("--check-layout")
     let ratePresets = NSPopUpButton(frame:.zero,pullsDown:false)
     var pendingSince:Date?, lastInspection = Date.distantPast
@@ -43,6 +49,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let saveButton = NSButton(title:"保存设置",target:nil,action:nil)
     let permissionButton = NSButton(title:"授权辅助功能",target:nil,action:nil)
     var contactElements: [String: [AXUIElement]] = [:]
+    var contactOpeners = [String:AXUIElement]()
     var sendText = "？"
     let prefs = UserDefaults.standard
     let interval = NSTextField(string:"0.5")
@@ -77,7 +84,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for (title,action,key) in [("撤销","undo:","z"),("剪切","cut:","x"),("复制","copy:","c"),("粘贴","paste:","v"),("全选","selectAll:","a")] {editMenu.addItem(withTitle:title,action:NSSelectorFromString(action),keyEquivalent:key)}
         editItem.submenu = editMenu; appMenu.addItem(editItem); NSApp.mainMenu = appMenu
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 18
-        let outer = NSScrollView(frame:window.contentView!.bounds);outer.autoresizingMask = [.width,.height];outer.hasVerticalScroller = true;outer.drawsBackground = false
+        let outer = NSScrollView(frame:NSRect(x:0,y:120,width:window.contentView!.bounds.width,height:window.contentView!.bounds.height-120));outer.autoresizingMask = [.width,.height];outer.hasVerticalScroller = true;outer.drawsBackground = false
         let document = NSView();document.translatesAutoresizingMaskIntoConstraints = false;outer.documentView = document;window.contentView!.addSubview(outer)
         NSLayoutConstraint.activate([document.widthAnchor.constraint(equalTo:outer.contentView.widthAnchor)])
         stack.translatesAutoresizingMaskIntoConstraints = false;document.addSubview(stack)
@@ -100,14 +107,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         contacts.widthAnchor.constraint(equalToConstant:400).isActive = true;contacts.target = self;contacts.action = #selector(selectionChanged)
         refreshButton.target = self;refreshButton.action = #selector(refreshContacts)
-        stack.addArrangedSubview(card([label("01  收件会话"),NSStackView(views:[contacts,refreshButton])]))
-        mode.selectedSegment = prefs.integer(forKey:"mode"); mode.target = self;mode.action = #selector(modeChanged)
+        searchField.placeholderString = "输入昵称，搜索列表外的联系人";searchField.widthAnchor.constraint(equalToConstant:350).isActive = true
+        searchField.target = self;searchField.action = #selector(searchContacts)
+        searchButton.target = self;searchButton.action = #selector(searchContacts)
+        moreButton.target = self;moreButton.action = #selector(loadMore)
+        stack.addArrangedSubview(card([label("01  收件会话"),NSStackView(views:[contacts,refreshButton]),NSStackView(views:[searchField,searchButton,moreButton])]))
+        mode.selectedSegment = prefs.integer(forKey:"mode") == 1 ? 1 : 0; mode.target = self;mode.action = #selector(modeChanged)
         timePicker.datePickerStyle = .textFieldAndStepper;timePicker.datePickerElements = [.hourMinute];timePicker.timeZone = DailySchedule.calendar.timeZone
-        let hour = prefs.object(forKey:"dailyHour") as? Int ?? 20;let minute = prefs.integer(forKey:"dailyMinute")
+        let savedHour = prefs.object(forKey:"dailyHour") as? Int ?? 20;let savedMinute = prefs.integer(forKey:"dailyMinute")
+        let hour = (0...23).contains(savedHour) ? savedHour : 20;let minute = (0...59).contains(savedMinute) ? savedMinute : 0
         timePicker.dateValue = DailySchedule.calendar.date(bySettingHour:hour,minute:minute,second:0,of:Date())!
         interval.widthAnchor.constraint(equalToConstant:72).isActive = true;limit.widthAnchor.constraint(equalToConstant:90).isActive = true
         ratePresets.addItems(withTitles:["自定义","0.1秒 · 10条/秒","0.2秒 · 5条/秒","0.5秒 · 2条/秒","1秒 · 1条/秒"])
         ratePresets.target = self;ratePresets.action = #selector(rateChanged)
+        interval.delegate = self;syncRatePreset()
         let repeatRow = NSStackView(views:[NSTextField(labelWithString:"间隔"),interval,NSTextField(labelWithString:"秒 · 总共"),limit,NSTextField(labelWithString:"次")]);repeatRow.spacing = 8
         let dailyRow = NSStackView(views:[NSTextField(labelWithString:"每天"),timePicker,NSTextField(labelWithString:"北京时间 · 每天最多尝试一次")]);dailyRow.spacing = 10
         modeHint.widthAnchor.constraint(equalToConstant:560).isActive = true;modeHint.font = .systemFont(ofSize:12);modeHint.textColor = .secondaryLabelColor
@@ -123,9 +136,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         previewButton.target = self;previewButton.action = #selector(preview)
         permissionButton.title = "连接授权";permissionButton.target = self;permissionButton.action = #selector(requestAccessibility)
         let buttons = NSStackView(views:[startButton,stopButton,previewButton,saveButton,permissionButton]);buttons.spacing = 10
-        stack.addArrangedSubview(buttons)
+        let footer = NSStackView(views:[buttons,progress,status]);footer.orientation = .vertical;footer.alignment = .leading;footer.spacing = 10
+        footer.translatesAutoresizingMaskIntoConstraints = false;window.contentView!.addSubview(footer)
+        NSLayoutConstraint.activate([footer.leadingAnchor.constraint(equalTo:window.contentView!.leadingAnchor,constant:28),footer.trailingAnchor.constraint(equalTo:window.contentView!.trailingAnchor,constant:-28),footer.bottomAnchor.constraint(equalTo:window.contentView!.bottomAnchor,constant:-16)])
         status.widthAnchor.constraint(equalToConstant:604).isActive = true;status.font = .systemFont(ofSize:12);status.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(NSStackView(views:[progress]));stack.addArrangedSubview(status)
+
+        NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.willSleepNotification,object:nil,queue:.main) { [weak self] _ in
+            if let self = self, self.timer != nil {self.finish("电脑即将休眠，已停止正在执行的发送。")}
+        }
         modeChanged();status.stringValue = "先在抖音打开消息面板，然后刷新会话。退出 Codex 后本应用仍可运行。"
         if isPreview {
             window.setFrameOrigin(NSPoint(x:-10000,y:-10000));window.orderBack(nil)
@@ -134,13 +152,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for card in stack.arrangedSubviews {print("ROW",card.frame)}
             DispatchQueue.main.asyncAfter(deadline:.now()+0.1) { NSApp.terminate(nil) }
         } else {
-            window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
+            window.makeKeyAndOrderFront(nil);window.contentView!.layoutSubtreeIfNeeded()
+            outer.contentView.scroll(to:NSPoint(x:0,y:max(0,document.bounds.height-outer.contentView.bounds.height)));outer.reflectScrolledClipView(outer.contentView)
+            NSApp.activate(ignoringOtherApps:true)
             if AXIsProcessTrusted() {refreshContacts()}
         }
     }
+    func syncRatePreset() {
+        let index = SendRate.parse(interval.stringValue).flatMap{[0.1,0.2,0.5,1.0].firstIndex(of:$0)}
+        ratePresets.selectItem(at:index.map{$0+1} ?? 0)
+    }
+    func controlTextDidChange(_ notification:Notification) {syncRatePreset()}
     @objc func rateChanged() {
         let rates = [0.0,0.1,0.2,0.5,1.0]
-        if ratePresets.indexOfSelectedItem > 0 {interval.stringValue = String(rates[ratePresets.indexOfSelectedItem])}
+        if ratePresets.indexOfSelectedItem > 0 {interval.stringValue = String(rates[ratePresets.indexOfSelectedItem])};syncRatePreset()
     }
     @objc func modeChanged() {
         let daily = mode.selectedSegment == 1
@@ -172,14 +197,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let token = generation
         DispatchQueue.main.asyncAfter(deadline:.now()+0.6) { [weak self] in
             guard let self = self, self.dailyActive, token == self.generation else {return}
-            self.refreshContacts()
-            guard self.contactElements[selected]?.count == 1 else {self.targetName = selected;self.finish("所选会话未加载，今日计划未发送。请在抖音打开消息面板。");return}
-            self.contacts.selectItem(withTitle:selected);self.targetName = selected
+            self.targetName = selected
             self.prepareSend()
         }
     }
     func setEditing(_ enabled: Bool) {
         startButton.isEnabled = enabled;stopButton.isEnabled = !enabled;contacts.isEnabled = enabled;refreshButton.isEnabled = enabled
+        searchField.isEnabled = enabled;searchButton.isEnabled = enabled;moreButton.isEnabled = enabled
         message.isEditable = enabled;saveButton.isEnabled = enabled;previewButton.isEnabled = enabled;mode.isEnabled = enabled;timePicker.isEnabled = enabled && mode.selectedSegment == 1
         ratePresets.isEnabled = enabled && mode.selectedSegment == 0
         interval.isEnabled = enabled && mode.selectedSegment == 0;limit.isEnabled = enabled && mode.selectedSegment == 0
@@ -202,53 +226,132 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         prefs.set(clock.hour!,forKey:"dailyHour");prefs.set(clock.minute!,forKey:"dailyMinute")
         prefs.synchronize(); status.stringValue = "设置已保存。重新打开后可以继续使用。"
     }
-    func dfs(_ e:AXUIElement,_ depth:Int = 0)->[AXUIElement] {
-        if depth > 40 {return []}; return [e] + children(e).flatMap{dfs($0,depth+1)}
+    func dfs(_ root:AXUIElement)->[AXUIElement] {
+        var result = [AXUIElement](), stack = [(root,0)]
+        while let (node,depth) = stack.popLast(), result.count < 6000 {
+            result.append(node)
+            if depth < 40 {stack.append(contentsOf:children(node).reversed().map{($0,depth+1)})}
+        }
+        return result
     }
-    @objc func refreshContacts() {
-        guard AXIsProcessTrusted() else {status.stringValue = "请先点击授权辅助功能。"; return}
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {status.stringValue = "请先打开抖音和消息面板。"; return}
+    func searchContext()->(NSRunningApplication,AXUIElement,AXUIElement)? {
+        guard AXIsProcessTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {return nil}
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetAttributeValue(root,"AXManualAccessibility" as CFString,kCFBooleanTrue)
-        let fields = walk(root).filter{ string($0,"AXRole") == "AXTextField" && string($0,"AXPlaceholderValue") == "搜索" }
-        guard fields.count == 1 else {status.stringValue = "请先打开抖音右上角的消息面板，再刷新。"; return}
+        let fields = walk(root).filter{string($0,"AXRole") == "AXTextField" && string($0,"AXPlaceholderValue") == "搜索"}
+        guard fields.count == 1 else {return nil}
         var scope = fields[0]
         for _ in 0..<3 {if let parent = attribute(scope,"AXParent") {scope = parent as! AXUIElement}}
-        var nextIsName = false; var order = [String](); var found = [String:[AXUIElement]]()
+        return (app,fields[0],scope)
+    }
+    @discardableResult func collectContacts(preserving previous:String? = nil)->Bool {
+        contactElements.removeAll();contactOpeners.removeAll()
+        guard let (_,_,scope) = searchContext() else {status.stringValue = AXIsProcessTrusted() ? "请先在抖音打开消息面板。" : "请先点击连接授权。";return false}
+        var lastName:String?;var nextIsName = false;var found = [String:[AXUIElement]]();var order = [String]()
         for node in dfs(scope) {
             if string(node,"AXRole") == "AXImage", !string(node,"AXDescription").isEmpty {nextIsName = true}
             else if nextIsName, string(node,"AXRole") == "AXStaticText" {
-                nextIsName = false; let name = clean(string(node,"AXValue")); if name.isEmpty {continue}
-                if found[name] == nil {order.append(name)}; found[name,default:[]].append(node)
+                nextIsName = false
+                let nameNode = attribute(node,"AXParent").map{$0 as! AXUIElement} ?? node
+                let parts = dfs(nameNode).filter{string($0,"AXRole") == "AXStaticText"}.map{string($0,"AXValue")}
+                let name = MessageRules.contactName(parts)
+                guard !name.isEmpty else {continue}
+                if found[name] == nil {order.append(name)}
+                found[name,default:[]].append(nameNode);lastName = name
+            } else if string(node,"AXRole") == "AXStaticText",string(node,"AXValue") == "发消息",let name = lastName {
+                contactOpeners[name] = node
             }
         }
-        guard !order.isEmpty else {status.stringValue = "未读到会话，请在抖音打开消息列表再刷新。"; return}
-        let old = contacts.titleOfSelectedItem ?? targetName
-        contacts.removeAllItems(); contacts.addItems(withTitles:order); contactElements = found
-        if order.contains(old) {contacts.selectItem(withTitle:old)}
-        selectionChanged(); status.stringValue = "已读取 \(order.count) 个会话。请选择收件人。"
+        contactElements = found
+        for name in order where !knownNames.contains(name) {knownNames.append(name)}
+        let old = previous ?? contacts.titleOfSelectedItem ?? targetName
+        contacts.removeAllItems();contacts.addItem(withTitle:"请选择会话");contacts.addItems(withTitles:knownNames)
+        if knownNames.contains(old) {contacts.selectItem(withTitle:old)}
+        else {contacts.selectItem(at:0)}
+        selectionChanged()
+        status.stringValue = "本页 \(order.count) 个，累计 \(knownNames.count) 个。可搜索昵称或加载更多；不会自动改选他人。"
+        return true
     }
-    func openSelected(_ then: @escaping () -> Void) {
-        let name = contacts.titleOfSelectedItem ?? ""
-        guard let matches = contactElements[name], matches.count == 1 else {status.stringValue = "请刷新会话；同名会话需先在抖音核实身份。"; return}
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {status.stringValue = "请先打开抖音。"; return}
-        let node = matches[0]
-        guard let pos = attribute(node,"AXPosition"), let size = attribute(node,"AXSize") else {status.stringValue = "会话位置已变化，请刷新。";return}
-        var point = CGPoint.zero; var dimensions = CGSize.zero
-        guard AXValueGetValue(pos as! AXValue,.cgPoint,&point), AXValueGetValue(size as! AXValue,.cgSize,&dimensions), dimensions.width > 0, dimensions.height > 0 else {status.stringValue = "会话不在可见区域，请先在抖音打开该会话。";return}
+    @objc func refreshContacts() {
+        guard timer == nil, !dailyActive else {return}
+        _ = collectContacts()
+    }
+    func point(_ node:AXUIElement)->CGPoint? {
+        guard let pos = attribute(node,"AXPosition"),let size = attribute(node,"AXSize") else {return nil}
+        var p = CGPoint.zero;var dimensions = CGSize.zero
+        guard AXValueGetValue(pos as! AXValue,.cgPoint,&p),AXValueGetValue(size as! AXValue,.cgSize,&dimensions),dimensions.width > 0,dimensions.height > 0 else {return nil}
+        return CGPoint(x:p.x+dimensions.width/2,y:p.y+dimensions.height/2)
+    }
+    func clickPoint(_ p:CGPoint) {
+        CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:p,mouseButton:.left)?.post(tap:.cghidEventTap)
+        CGEvent(mouseEventSource:nil,mouseType:.leftMouseUp,mouseCursorPosition:p,mouseButton:.left)?.post(tap:.cghidEventTap)
+    }
+    @discardableResult func typeText(_ text:String,to pid:pid_t)->Bool {
+        for var units in MessageRules.chunks(text) {
+            guard let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true),let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false) else {return false}
+            down.keyboardSetUnicodeString(stringLength:units.count,unicodeString:&units);up.keyboardSetUnicodeString(stringLength:units.count,unicodeString:&units)
+            down.postToPid(pid);up.postToPid(pid)
+        }
+        return true
+    }
+    func searchInDouyin(_ query:String,token:Int,completion:@escaping ()->Void) {
+        guard let (app,field,_) = searchContext(),let position = point(field) else {finish("请先授权并打开抖音消息面板。");return}
         NSApp.yieldActivation(to:app);app.activate(options:[.activateAllWindows])
-        let token = generation
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { [weak self] in
-            guard let self = self, token == self.generation else {return}
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音未切到前台，请手动打开抖音后重试。");return}
-            let center = CGPoint(x:point.x+dimensions.width/2,y:point.y+dimensions.height/2)
-            CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:center,mouseButton:.left)?.post(tap:.cghidEventTap)
-            CGEvent(mouseEventSource:nil,mouseType:.leftMouseUp,mouseCursorPosition:center,mouseButton:.left)?.post(tap:.cghidEventTap)
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.3) { [weak self] in
+            guard let self = self,token == self.generation else {return}
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音未切到前台，请先打开抖音。");return}
+            self.clickPoint(position)
+            DispatchQueue.main.asyncAfter(deadline:.now()+0.15) { [weak self] in
+                guard let self = self,token == self.generation else {return}
+                let root = AXUIElementCreateApplication(app.processIdentifier)
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),CFEqual(focus,field) else {self.finish("搜索框未获得焦点，未输入。");return}
+                let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true);down?.flags = .maskCommand;down?.postToPid(app.processIdentifier)
+                let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.flags = .maskCommand;up?.postToPid(app.processIdentifier)
+                CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:true)?.postToPid(app.processIdentifier)
+                CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:false)?.postToPid(app.processIdentifier)
+                guard self.typeText(query,to:app.processIdentifier) else {self.finish("无法输入搜索内容。");return}
+                DispatchQueue.main.asyncAfter(deadline:.now()+0.8) { [weak self] in
+                    guard let self = self,token == self.generation else {return}
+                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let (_,current,_) = self.searchContext(),string(current,"AXValue") == query else {self.finish("搜索内容已变化，请重新搜索。");return}
+                    completion()
+                }
+            }
+        }
+    }
+    @objc func searchContacts() {
+        let query = clean(searchField.stringValue)
+        guard MessageRules.valid(query) else {status.stringValue = "请输入有效的单行昵称。";return}
+        generation += 1;let token = generation;let old = targetName;setEditing(false)
+        status.stringValue = "正在搜索抖音联系人…"
+        searchInDouyin(query,token:token) { [weak self] in
+            guard let self = self else {return}
+            _ = self.collectContacts(preserving:old);self.setEditing(true)
+        }
+    }
+    @objc func loadMore() {
+        generation += 1;let token = generation;let old = targetName;setEditing(false)
+        searchInDouyin("",token:token) { [weak self] in
+            guard let self = self,let (app,_,scope) = self.searchContext(),let center = self.point(scope) else {self?.finish("未找到消息列表。");return}
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音已离开前台，停止加载。");return}
+            CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:center,mouseButton:.left)?.post(tap:.cghidEventTap)
+            let wheel = CGEvent(scrollWheelEvent2Source:nil,units:.pixel,wheelCount:1,wheel1:-550,wheel2:0,wheel3:0);wheel?.location = center;wheel?.post(tap:.cghidEventTap)
+            DispatchQueue.main.asyncAfter(deadline:.now()+0.6) { [weak self] in
+                guard let self = self,token == self.generation else {return}
+                _ = self.collectContacts(preserving:old);self.setEditing(true)
+            }
+        }
+    }
+    func openSelected(_ then:@escaping ()->Void) {
+        let name = targetName;let token = generation
+        searchInDouyin(name,token:token) { [weak self] in
+            guard let self = self else {return}
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleID,self.collectContacts(preserving:name),let matches = self.contactElements[name],matches.count == 1,let position = self.point(self.contactOpeners[name] ?? matches[0]) else {self.targetName = name;self.finish("未找到唯一匹配的联系人，未发送。请搜索并核实同名会话。");return}
+            self.targetName = name;self.clickPoint(position)
             DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { [weak self] in guard self?.generation == token else {return};then() }
         }
     }
     func finish(_ result: String) {
-        generation += 1;pendingSince = nil;timer?.invalidate();timer = nil;awaitingConfirmation = false;dailySending = false
+        generation += 1;flow = nil;pendingSince = nil;timer?.invalidate();timer = nil;awaitingConfirmation = false;dailySending = false
         setEditing(!dailyActive)
         stateBadge.stringValue = dailyActive ? "● 每日计划待命" : "● 已停止"
         stateBadge.textColor = dailyActive ? .systemOrange : .secondaryLabelColor
@@ -262,10 +365,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard AXIsProcessTrusted() else {requestAccessibility(); return}
         targetName = contacts.titleOfSelectedItem ?? ""
         let text = message.string
-        guard !clean(text).isEmpty, text.utf16.count <= 1000, !text.contains("\n"), !text.contains("\r"), !text.unicodeScalars.contains(where:{$0.value < 32}) else {status.stringValue = "请输入 1 到 1000 个 UTF-16 字符的单行消息，不含制表等控制字符。";return}
-        guard SendRate.parse(interval.stringValue) != nil, let count = Int(limit.stringValue), count > 0, count <= 100000 else {status.stringValue = "间隔至少0.1秒，总次数为1到100000。";return}
+        guard MessageRules.valid(text) else {status.stringValue = "请输入 1 到 1000 个 UTF-16 字符的单行消息，不含制表等控制字符。";return}
+        guard mode.selectedSegment == 1 || (SendRate.parse(interval.stringValue) != nil && (Int(limit.stringValue).map{(1...100000).contains($0)} ?? false)) else {status.stringValue = "间隔至少0.1秒，总次数为1到100000。";return}
         sendText = text; saveSettings()
-        guard contactElements[targetName]?.count == 1 else {status.stringValue = "请先刷新并选择唯一的会话。";return}
+        guard targetName != "请选择会话", !targetName.isEmpty, knownNames.contains(targetName) else {status.stringValue = "请先刷新并选择唯一的会话。";return}
         if mode.selectedSegment == 1 && !previewOnly {armDaily();return}
         prepareSend()
     }
@@ -283,8 +386,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     func bindAndStart(preview: Bool = false) {
-        guard let seconds = SendRate.parse(interval.stringValue) else {status.stringValue = "请输入至少 0.1 秒的发送间隔。"; return}
-        guard let count = Int(limit.stringValue), count > 0, count <= 100000 else {status.stringValue = "总次数应为 1 到 100000。"; return}
+        guard let seconds = (mode.selectedSegment == 1 ? 1 : SendRate.parse(interval.stringValue)) else {finish("请输入至少0.1秒的发送间隔。");return}
+        guard let count = (mode.selectedSegment == 1 ? 1 : Int(limit.stringValue)), (1...100000).contains(count) else {finish("总次数应为1到100000。");return}
         guard AXIsProcessTrusted() else {
             status.stringValue = "尚无辅助功能权限。请在系统设置 > 隐私与安全性 > 辅助功能中允许此控制器，之后重新打开。"
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary
@@ -293,9 +396,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {status.stringValue = "请先打开并登录抖音。"; return}
         let root = AXUIElementCreateApplication(app.processIdentifier)
         let editors = walk(root).filter {string($0,"AXRole") == "AXTextArea"}
-        guard editors.count == 1 else {status.stringValue = "请在抖音打开指定会话，并点一下消息输入框。"; return}
+        guard editors.count == 1 else {finish("请在抖音打开指定会话，并点一下消息输入框。");return}
         let input = editors[0]
-        guard isEmpty(input) else {status.stringValue = "输入框中已有内容，请先清空后再开始。"; return}
+        guard isEmpty(input) else {finish("输入框中已有内容，请先清空后再开始。");return}
         var ancestor = input; var scope: AXUIElement?; var header: AXUIElement?
         for _ in 0..<7 {
             guard let parent = attribute(ancestor,"AXParent") else {break}
@@ -331,54 +434,42 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate {
         status.stringValue = "运行中：每 \(seconds) 秒一次。点击停止或切换应用可停止。"
         AXUIElementSetAttributeValue(input,"AXFocused" as CFString,kCFBooleanTrue)
         NSApp.yieldActivation(to:app);app.activate(options:[.activateAllWindows])
-        timer = Timer.scheduledTimer(withTimeInterval:dailySending ? 1 : seconds,repeats:true) {[weak self] _ in self?.tick()}
+        flow = SendFlow(message:sendText,interval:seconds,total:total)
+        timer = Timer.scheduledTimer(withTimeInterval:0.05,repeats:true) {[weak self] _ in self?.tick()}
     }
-    func isEmpty(_ e: AXUIElement) -> Bool {let text = clean(string(e,"AXValue")); return text.isEmpty || text == "发送消息"}
+    func isEmpty(_ e:AXUIElement)->Bool {MessageRules.emptyEditor(string(e,"AXValue"))}
     func tick() {
-        guard let input = editor, let scope = chat else {finish("输入框失效，已停止。"); return}
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {finish("已切换应用，自动停止。"); return}
+        guard let input = editor,let scope = chat,var state = flow else {finish("输入框失效，已停止。");return}
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {finish("已切换应用，自动停止。");return}
         let root = AXUIElementCreateApplication(pid)
-        guard let focused = attribute(root,"AXFocusedUIElement"), CFEqual(focused,input) else {finish("输入焦点变化，自动停止。"); return}
-        guard let header = boundHeader, clean(string(header,"AXValue")) == targetName else {finish("会话变化，自动停止。");return}
+        guard let focused = attribute(root,"AXFocusedUIElement"),CFEqual(focused,input),let header = boundHeader,clean(string(header,"AXValue")) == targetName else {finish("输入焦点或会话变化，自动停止。");return}
         let now = Date()
         if now.timeIntervalSince(lastInspection) >= 1 {
             lastInspection = now
-            let problem = walk(scope,maxNodes:1000).contains { e in
-                let text = string(e,"AXValue")
-                return ["发送失败","发送频繁","操作频繁","已被限制","发送过于频繁"].contains(where:{text.contains($0)})
+            let problem = walk(scope,maxNodes:1000).contains { node in
+                MessageRules.failureIndicator(role:string(node,"AXRole"),label:string(node,"AXTitle")+string(node,"AXDescription")+string(node,"AXValue"))
             }
             guard !problem else {finish("检测到发送异常或平台限制，已停止。");return}
         }
-        if !isEmpty(input) {
-            if awaitingConfirmation, let since = pendingSince, now.timeIntervalSince(since) < 5 {return}
-            finish("输入框未清空，已停止。请检查上一条消息。");return
+        let action = state.step(now:ProcessInfo.processInfo.systemUptime,editor:string(input,"AXValue"));flow = state;sent = state.sent
+        switch action {
+        case .type:
+            guard typeText(sendText,to:pid) else {finish("无法输入消息，已停止。");return}
+        case .enter:
+            CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true)?.postToPid(pid)
+            CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false)?.postToPid(pid)
+        case .confirmed: progress.stringValue = "界面发送操作：\(sent) / \(total)"
+        case .complete:
+            progress.stringValue = "界面发送操作：\(sent) / \(total)";finish("已完成\(sent)次界面发送操作，不代表对方已收取。")
+        case .failed(let reason): finish(reason)
+        case .wait: break
         }
-        if awaitingConfirmation {
-            sent += 1; progress.stringValue = "已发送：\(sent) / \(total)"; awaitingConfirmation = false
-        }
-        guard sent < total else {finish("已完成 \(sent) 次发送。该计数表示界面发送操作，不代表对方已收取。"); return}
-        // Unicode input is sent only to the verified Douyin process.
-        let units = Array(sendText.utf16)
-        var offset = 0
-        while offset < units.count {
-            var end = min(offset+20,units.count)
-            if end < units.count && units[end-1] >= 0xD800 && units[end-1] <= 0xDBFF {end -= 1}
-            var chars = Array(units[offset..<end])
-            guard let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true), let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false) else {finish("无法创建输入事件，已停止。"); return}
-            down.keyboardSetUnicodeString(stringLength:chars.count,unicodeString:&chars)
-            up.keyboardSetUnicodeString(stringLength:chars.count,unicodeString:&chars)
-            down.postToPid(pid); up.postToPid(pid); offset = end
-        }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-            let focusedNow = attribute(root,"AXFocusedUIElement"), CFEqual(focusedNow,input) else {finish("输入焦点变化，未按发送键。"); return}
-        CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true)?.postToPid(pid)
-        CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false)?.postToPid(pid)
-        awaitingConfirmation = true;pendingSince = Date()
     }
-    func windowWillClose(_ notification: Notification) {stopClicked();saveSettings();NSApp.terminate(nil)}
+    func applicationWillTerminate(_ notification:Notification) {if !isPreview {stopClicked();saveSettings()}}
+    func windowWillClose(_ notification: Notification) {NSApp.terminate(nil)}
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {true}
 }
-let lockPath = NSTemporaryDirectory() + "douyin-message-assistant.lock"
+let lockPath = NSTemporaryDirectory() + (CommandLine.arguments.contains("--check-layout") ? "douyin-message-assistant-layout.lock" : "douyin-message-assistant.lock")
 let lockFD = Darwin.open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
 if lockFD < 0 || flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
     exit(0)
