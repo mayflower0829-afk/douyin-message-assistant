@@ -409,11 +409,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
                     guard let self = self,token == self.generation else {return}
                     let root = AXUIElementCreateApplication(app.processIdentifier)
                     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),(CFEqual(focus,field) || (string(focus as! AXUIElement,"AXRole") == "AXTextField" && string(focus as! AXUIElement,"AXPlaceholderValue") == "搜索")) else {self.finish("搜索框未获得焦点，未输入。",haltBatch:true);return}
-                    let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true);down?.flags = .maskCommand;down?.postToPid(app.processIdentifier)
-                    let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.flags = .maskCommand;up?.postToPid(app.processIdentifier)
-                    CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:true)?.postToPid(app.processIdentifier)
-                    CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:false)?.postToPid(app.processIdentifier)
-                    guard self.typeText(query,to:app.processIdentifier) else {self.finish("无法输入搜索内容。",haltBatch:true);return}
+                    // Replace the entire native field value. Cmd+A can leave part of the old
+                    // query selected incorrectly under an input method, producing mixed names.
+                    guard AXUIElementSetAttributeValue(field,kAXValueAttribute as CFString,query as CFString) == .success else {self.finish("无法替换搜索内容，未发送。",haltBatch:true);return}
                     DispatchQueue.main.asyncAfter(deadline:.now()+0.8) { [weak self] in
                         guard let self = self,token == self.generation else {return}
                         guard let (_,current,_) = self.searchContext(),string(current,"AXValue") == query else {self.finish("搜索内容已变化，请重新搜索。",haltBatch:true);return}
