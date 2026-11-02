@@ -46,3 +46,42 @@ check(failed.step(now:5,editor:"") == .failed("消息未完整写入输入框，
 var placeholder = SendFlow(message:"发送消息",interval:0.1,total:1)
 _ = placeholder.step(now:0,editor:"发送消息\n\u{200B}")
 check(placeholder.step(now:0.1,editor:"发送消息\n\u{200B}") == .wait,"placeholder is never mistaken for typed content")
+
+check(BatchRun.roster([" 甲 ","甲","乙","","请选择会话"]) == ["甲","乙"],"roster persists normalized unique selections")
+let day = "2026-11-03"
+var batch = BatchRun(people:["甲","乙","丙"],dryRun:false)
+check(batch.next(day:day,attempts:["甲":day]) == "乙","skips today's attempted friend")
+check(batch.next(day:day,attempts:[:]) == nil && batch.current == "乙" && !batch.finished,"does not start two friends concurrently")
+batch.complete(.sent);batch.complete(.sent)
+check(batch.results.count == 2,"completion callback cannot count a friend twice")
+check(batch.next(day:day,attempts:[:]) == "丙","automatically advances to next selected friend")
+batch.cancel()
+check(batch.finished && batch.next(day:day,attempts:[:]) == nil,"stop prevents all later jobs")
+check(batch.results.map{$0.outcome} == [.skipped,.sent,.cancelled],"reports per-friend skipped sent and stopped outcomes")
+var beforeStart = BatchRun(people:["甲","乙"],dryRun:false)
+beforeStart.cancel();beforeStart.cancel()
+check(beforeStart.results.count == 2 && beforeStart.finished,"cancelling before first friend is idempotent")
+var dryBatch = BatchRun(people:["甲","乙"],dryRun:true)
+check(dryBatch.next(day:day,attempts:["甲":day]) == "甲","precheck does not consume or obey send reservations")
+dryBatch.complete(.verified)
+check(dryBatch.next(day:day,attempts:[:]) == "乙","precheck covers whole roster")
+dryBatch.complete(.verified)
+check(dryBatch.finished && dryBatch.results.allSatisfy{$0.outcome == .verified},"precheck has no sent outcomes")
+var allSkipped = BatchRun(people:["甲","乙"],dryRun:false)
+check(allSkipped.next(day:day,attempts:["甲":day,"乙":day]) == nil && allSkipped.finished,"all-duplicate batch finishes without sending")
+var oneClick = BatchRun(people:["甲","乙"],dryRun:false)
+var ledger = [String:String](), typed = 0, entered = 0
+while let friend = oneClick.next(day:day,attempts:ledger) {
+    ledger[friend] = day
+    var single = SendFlow(message:"问候",interval:1,total:1)
+    if single.step(now:0,editor:"") == .type {typed += 1}
+    if single.step(now:0.05,editor:"问候") == .enter {entered += 1}
+    check(single.step(now:0.1,editor:"") == .complete && single.sent == 1,"batch caps each friend at one message")
+    oneClick.complete(.sent)
+}
+check(typed == 2 && entered == 2 && oneClick.finished,"one action processes two friends exactly once")
+var restarted = BatchRun(people:["甲","乙"],dryRun:false)
+check(restarted.next(day:day,attempts:ledger) == nil && restarted.finished,"saved daily reservations skip a repeated batch after restart")
+check(BatchRun(people:[],dryRun:false).finished,"empty roster never schedules a job")
+
+check(BatchRun.roster(["甲","含\n换行"]) == ["甲"],"rejects control characters in recipient names")

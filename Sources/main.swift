@@ -21,8 +21,21 @@ func clean(_ s: String) -> String {
     s.replacingOccurrences(of:"\u{200B}",with:"").trimmingCharacters(in:.whitespacesAndNewlines)
 }
 
+final class FlippedListView:NSView {override var isFlipped:Bool {true}}
+
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     var window: NSWindow!
+    var roster = [String](), scheduledRoster = [String]()
+    var batchRun:BatchRun?
+    var batchOriginalSelection = ""
+    var lastBatchResults = [[String:String]]()
+    let rosterButton = NSButton(title:"选择好友名单",target:nil,action:nil)
+    let rosterLabel = NSTextField(labelWithString:"未选择续火花好友")
+    let batchNowButton = NSButton(title:"立即一键续火花",target:nil,action:nil)
+    let resultsButton = NSButton(title:"查看执行结果",target:nil,action:nil)
+    var rosterPanel:NSPanel?, rosterChecks = [NSButton]()
+    var rosterCountLabel:NSTextField?
+
     let searchField = NSSearchField()
     let searchButton = NSButton(title:"搜索抖音",target:nil,action:nil)
     let moreButton = NSButton(title:"加载更多",target:nil,action:nil)
@@ -30,6 +43,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     var flow: SendFlow?
 
     let isPreview = CommandLine.arguments.contains("--check-layout")
+    let isDemo = CommandLine.arguments.contains("--demo")
     let ratePresets = NSPopUpButton(frame:.zero,pullsDown:false)
     var pendingSince:Date?, lastInspection = Date.distantPast
     let mode = NSSegmentedControl(labels:["定时发送","每日续火花"],trackingMode:.selectOne,target:nil,action:nil)
@@ -51,7 +65,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     var contactElements: [String: [AXUIElement]] = [:]
     var contactOpeners = [String:AXUIElement]()
     var sendText = "？"
-    let prefs = UserDefaults.standard
+    let prefs = CommandLine.arguments.contains("--demo") ? UserDefaults(suiteName:"local.douyin.messageassistant.demo")! : UserDefaults.standard
     let interval = NSTextField(string:"0.5")
     let limit = NSTextField(string:"1")
     let status = NSTextField(wrappingLabelWithString:"已停止。请先在抖音打开指定会话，再点击开始。")
@@ -63,6 +77,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     var awaitingConfirmation = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if isDemo {prefs.register(defaults:["mode":1])}
+        roster = BatchRun.roster(prefs.stringArray(forKey:"streakRoster") ?? [])
+        lastBatchResults = prefs.array(forKey:"batchResults") as? [[String:String]] ?? []
         prefs.register(defaults:["recipient":"请选择会话","message":"？","interval":"0.5","count":"1"])
         targetName = prefs.string(forKey:"recipient") ?? "请选择会话"
         interval.stringValue = prefs.string(forKey:"interval") ?? "0.5"
@@ -84,7 +101,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         for (title,action,key) in [("撤销","undo:","z"),("剪切","cut:","x"),("复制","copy:","c"),("粘贴","paste:","v"),("全选","selectAll:","a")] {editMenu.addItem(withTitle:title,action:NSSelectorFromString(action),keyEquivalent:key)}
         editItem.submenu = editMenu; appMenu.addItem(editItem); NSApp.mainMenu = appMenu
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 18
-        let outer = NSScrollView(frame:NSRect(x:0,y:120,width:window.contentView!.bounds.width,height:window.contentView!.bounds.height-120));outer.autoresizingMask = [.width,.height];outer.hasVerticalScroller = true;outer.drawsBackground = false
+        let outer = NSScrollView(frame:NSRect(x:0,y:160,width:window.contentView!.bounds.width,height:window.contentView!.bounds.height-160));outer.autoresizingMask = [.width,.height];outer.hasVerticalScroller = true;outer.drawsBackground = false
         let document = NSView();document.translatesAutoresizingMaskIntoConstraints = false;outer.documentView = document;window.contentView!.addSubview(outer)
         NSLayoutConstraint.activate([document.widthAnchor.constraint(equalTo:outer.contentView.widthAnchor)])
         stack.translatesAutoresizingMaskIntoConstraints = false;document.addSubview(stack)
@@ -126,7 +143,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         let dailyRow = NSStackView(views:[NSTextField(labelWithString:"每天"),timePicker,NSTextField(labelWithString:"北京时间 · 每天最多尝试一次")]);dailyRow.spacing = 10
         modeHint.widthAnchor.constraint(equalToConstant:560).isActive = true;modeHint.font = .systemFont(ofSize:12);modeHint.textColor = .secondaryLabelColor
         nextLabel.font = .monospacedDigitSystemFont(ofSize:12,weight:.medium);nextLabel.textColor = .systemOrange
-        stack.addArrangedSubview(card([label("02  发送计划"),mode,repeatRow,ratePresets,dailyRow,modeHint,nextLabel]))
+        rosterLabel.font = .systemFont(ofSize:12,weight:.semibold);rosterLabel.textColor = .systemOrange
+        stack.addArrangedSubview(card([label("02  发送计划"),mode,repeatRow,ratePresets,dailyRow,rosterLabel,modeHint,nextLabel]))
         let scroll = NSScrollView();scroll.hasVerticalScroller = true;scroll.drawsBackground = false;scroll.borderType = .noBorder
         scroll.documentView = message;scroll.widthAnchor.constraint(equalToConstant:560).isActive = true;scroll.heightAnchor.constraint(equalToConstant:80).isActive = true
         message.isVerticallyResizable = true;message.isHorizontallyResizable = false;message.autoresizingMask = [.width];message.textContainer?.widthTracksTextView = true
@@ -136,16 +154,24 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         saveButton.target = self;saveButton.action = #selector(saveSettings)
         previewButton.target = self;previewButton.action = #selector(preview)
         permissionButton.title = "连接授权";permissionButton.target = self;permissionButton.action = #selector(requestAccessibility)
-        let buttons = NSStackView(views:[startButton,stopButton,previewButton,saveButton,permissionButton]);buttons.spacing = 10
-        let footer = NSStackView(views:[buttons,progress,status]);footer.orientation = .vertical;footer.alignment = .leading;footer.spacing = 10
+        rosterButton.target = self;rosterButton.action = #selector(editRoster)
+        batchNowButton.target = self;batchNowButton.action = #selector(batchNow);batchNowButton.bezelStyle = .rounded;batchNowButton.bezelColor = .systemOrange
+        resultsButton.target = self;resultsButton.action = #selector(showBatchResults)
+        let buttons = NSStackView(views:[batchNowButton,startButton,stopButton,previewButton]);buttons.spacing = 10
+        let settings = NSStackView(views:[rosterButton,resultsButton,saveButton,permissionButton]);settings.spacing = 10
+        let footer = NSStackView(views:[buttons,settings,progress,status]);footer.orientation = .vertical;footer.alignment = .leading;footer.spacing = 10
         footer.translatesAutoresizingMaskIntoConstraints = false;window.contentView!.addSubview(footer)
         NSLayoutConstraint.activate([footer.leadingAnchor.constraint(equalTo:window.contentView!.leadingAnchor,constant:28),footer.trailingAnchor.constraint(equalTo:window.contentView!.trailingAnchor,constant:-28),footer.bottomAnchor.constraint(equalTo:window.contentView!.bottomAnchor,constant:-16)])
         status.widthAnchor.constraint(equalToConstant:604).isActive = true;status.font = .systemFont(ofSize:12);status.textColor = .secondaryLabelColor
 
         NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.willSleepNotification,object:nil,queue:.main) { [weak self] _ in
-            if let self = self, self.timer != nil {self.finish("电脑即将休眠，已停止正在执行的发送。")}
+            if let self = self, self.timer != nil || self.batchRun != nil {self.finish("电脑即将休眠，已停止正在执行的发送。",haltBatch:true)}
         }
-        modeChanged();status.stringValue = "先在抖音打开消息面板，然后刷新会话。退出 Codex 后本应用仍可运行。"
+        if isDemo {
+            knownNames = ["示例好友甲","示例好友乙","示例好友丙"]
+            contacts.removeAllItems();contacts.addItem(withTitle:"请选择会话");contacts.addItems(withTitles:knownNames)
+        }
+        updateRosterLabel();modeChanged();status.stringValue = isDemo ? "演示模式：仅验证界面和名单保存，不访问抖音、不发送消息。" : "先在抖音打开消息面板，然后刷新会话。退出 Codex 后本应用仍可运行。"
         if isPreview {
             window.setFrameOrigin(NSPoint(x:-10000,y:-10000));window.orderBack(nil)
             window.contentView!.layoutSubtreeIfNeeded();window.contentView!.displayIfNeeded()
@@ -156,7 +182,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
             window.makeKeyAndOrderFront(nil);window.contentView!.layoutSubtreeIfNeeded()
             outer.contentView.scroll(to:NSPoint(x:0,y:max(0,document.bounds.height-outer.contentView.bounds.height)));outer.reflectScrolledClipView(outer.contentView)
             NSApp.activate(ignoringOtherApps:true)
-            if AXIsProcessTrusted() {refreshContacts()}
+            if !isDemo && AXIsProcessTrusted() {refreshContacts()}
         }
     }
     func syncRatePreset() {
@@ -171,16 +197,108 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     @objc func modeChanged() {
         let daily = mode.selectedSegment == 1
         interval.isEnabled = !daily;limit.isEnabled = !daily;ratePresets.isEnabled = !daily;timePicker.isEnabled = daily
-        startButton.title = daily ? "启用每日续火花" : "开始发送"
-        modeHint.stringValue = daily ? "应用保持运行；到点打开所选会话。休眠超过15分钟不补发；需双方互动才可能保持火花。" : "单行文字支持表情；间隔至少0.1秒。切换应用或会话会停止正在进行的发送。"
+        startButton.title = daily ? "启用每日计划" : "开始发送"
+        batchNowButton.isHidden = !daily;rosterButton.isHidden = !daily;rosterLabel.isHidden = !daily
+        batchNowButton.isEnabled = !dailyActive && batchRun == nil
+        rosterButton.isEnabled = !dailyActive && batchRun == nil
+        resultsButton.isEnabled = !lastBatchResults.isEmpty && batchRun == nil
+        modeHint.stringValue = daily ? "使用勾选名单，每人一条；今日已尝试者跳过。每天到点整批执行；错过15分钟不补发。" : "单行文字支持表情；间隔至少0.1秒。切换应用或会话会停止正在进行的发送。"
     }
-    @objc func preview() {previewOnly = true;start();previewOnly = false}
+    @objc func preview() {
+        if mode.selectedSegment == 1 {beginBatch(people:roster,dryRun:true);return}
+        previewOnly = true;start();previewOnly = false
+    }
+    func updateRosterLabel() {rosterLabel.stringValue = "已选 \(roster.count) 位好友 · 名单自动记住，每人一条"}
+    @objc func editRoster() {
+        guard batchRun == nil, !dailyActive else {return}
+        let names = BatchRun.roster(roster+knownNames).sorted{ $0.localizedStandardCompare($1) == .orderedAscending }
+        let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:460,height:560),styleMask:[.titled],backing:.buffered,defer:false)
+        panel.title = "勾选续火花好友";rosterPanel = panel
+        let hint = NSTextField(wrappingLabelWithString:"先搜索或加载更多收集联系人，再勾选好友。名单只在本机保存；请核实为你要联系的好友。")
+        hint.frame = NSRect(x:20,y:487,width:420,height:50);panel.contentView!.addSubview(hint)
+        let list = NSScrollView(frame:NSRect(x:20,y:80,width:420,height:395));list.hasVerticalScroller = true;list.borderType = .bezelBorder
+        let document = FlippedListView(frame:NSRect(x:0,y:0,width:400,height:max(395,CGFloat(names.count*30+12))))
+        rosterChecks = []
+        for (index,name) in names.enumerated() {
+            let check = NSButton(checkboxWithTitle:name,target:self,action:#selector(rosterChanged))
+            check.frame = NSRect(x:10,y:CGFloat(index*30+6),width:380,height:26);check.state = roster.contains(name) ? .on : .off
+            document.addSubview(check);rosterChecks.append(check)
+        }
+        if names.isEmpty {let empty = NSTextField(wrappingLabelWithString:"还没有联系人。请取消，先点刷新会话或搜索抖音。");empty.frame = NSRect(x:12,y:15,width:370,height:50);document.addSubview(empty)}
+        list.documentView = document;panel.contentView!.addSubview(list)
+        let count = NSTextField(labelWithString:"");count.frame = NSRect(x:20,y:42,width:420,height:20);rosterCountLabel = count;panel.contentView!.addSubview(count);rosterChanged()
+        let save = NSButton(title:"保存名单",target:self,action:#selector(saveRoster));save.frame = NSRect(x:330,y:12,width:110,height:28);panel.contentView!.addSubview(save)
+        let cancel = NSButton(title:"取消",target:self,action:#selector(cancelRoster));cancel.frame = NSRect(x:230,y:12,width:90,height:28);panel.contentView!.addSubview(cancel)
+        window.beginSheet(panel)
+    }
+    @objc func rosterChanged() {rosterCountLabel?.stringValue = "已勾选 \(rosterChecks.filter{$0.state == .on}.count) 位好友"}
+    @objc func saveRoster() {
+        roster = BatchRun.roster(rosterChecks.filter{$0.state == .on}.map{$0.title})
+        prefs.set(roster,forKey:"streakRoster");prefs.synchronize();updateRosterLabel();cancelRoster()
+        status.stringValue = "名单已保存。可立即一键续火花，或启用每日计划。"
+    }
+    @objc func cancelRoster() {if let panel = rosterPanel {window.endSheet(panel);panel.orderOut(nil)};rosterPanel = nil;rosterChecks = [];rosterCountLabel = nil}
+    @objc func batchNow() {beginBatch(people:roster,dryRun:false)}
+    func beginBatch(people:[String],dryRun:Bool) {
+        if isDemo {status.stringValue = "演示模式不访问抖音、不发送消息。";return}
+        guard batchRun == nil,timer == nil,rosterPanel == nil else {return}
+        guard !BatchRun.roster(people).isEmpty else {status.stringValue = "请先点击选择好友名单，并勾选至少一位好友。";return}
+        guard AXIsProcessTrusted() else {requestAccessibility();return}
+        guard MessageRules.valid(message.string) else {status.stringValue = "请先设置有效的单行消息。";return}
+        guard searchContext() != nil else {status.stringValue = "请先在抖音打开消息面板。";return}
+        sendText = message.string;saveSettings();batchOriginalSelection = contacts.titleOfSelectedItem ?? "请选择会话"
+        batchRun = BatchRun(people:people,dryRun:dryRun);lastBatchResults = [];generation += 1;setEditing(false)
+        advanceBatch()
+    }
+    func advanceBatch() {
+        guard var run = batchRun,run.current == nil else {return}
+        var attempts = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
+        let day = DailySchedule.dayKey(Date())
+        let person = run.next(day:day,attempts:attempts);batchRun = run
+        guard let person = person else {if run.finished {endBatch()};return}
+        if !run.dryRun {attempts[person] = day;prefs.set(attempts,forKey:"dailyAttempts");prefs.synchronize()}
+        targetName = person;dailySending = true
+        stateBadge.stringValue = run.dryRun ? "● 批量预检中" : "● 一键续火花执行中"
+        progress.stringValue = "已处理 \(run.results.count) / \(run.people.count) · 当前：\(person)"
+        previewOnly = run.dryRun;prepareSend();previewOnly = false
+    }
+    func storeBatchResults(_ values:[BatchResult]) {
+        lastBatchResults = values.map{["name":$0.name,"result":$0.outcome.text]}
+        prefs.set(lastBatchResults,forKey:"batchResults");prefs.synchronize()
+    }
+    func restoreBatchSelection() {
+        contacts.selectItem(withTitle:batchOriginalSelection)
+        if contacts.indexOfSelectedItem < 0 {contacts.selectItem(withTitle:"请选择会话")}
+        selectionChanged()
+    }
+    func endBatch() {
+        guard let run = batchRun else {return}
+        storeBatchResults(run.results);batchRun = nil;dailySending = false;restoreBatchSelection();setEditing(!dailyActive)
+        let sent = run.results.filter{$0.outcome == .sent}.count
+        let checked = run.results.filter{$0.outcome == .verified}.count
+        let skipped = run.results.filter{$0.outcome == .skipped}.count
+        let failed = run.results.filter{if case .failed = $0.outcome {return true};return false}.count
+        let cancelled = run.results.filter{$0.outcome == .cancelled}.count
+        progress.stringValue = "处理完成：\(run.results.count) / \(run.people.count) 位好友"
+        status.stringValue = "\(run.dryRun ? "预检通过" : "完成界面发送操作") \(run.dryRun ? checked : sent) 人；跳过 \(skipped)，失败 \(failed)，取消 \(cancelled)。可查看执行结果。"
+        stateBadge.stringValue = dailyActive ? "● 每日计划待命" : "● 已停止"
+        stateBadge.textColor = dailyActive ? .systemOrange : .secondaryLabelColor
+    }
+    @objc func showBatchResults() {
+        let alert = NSAlert();alert.messageText = "最近一批执行结果"
+        let text = NSTextView(frame:NSRect(x:0,y:0,width:480,height:320));text.isEditable = false;text.isRichText = false;text.isVerticallyResizable = true;text.isHorizontallyResizable = false;text.autoresizingMask = [.width];text.textContainer?.widthTracksTextView = true;text.font = .systemFont(ofSize:13)
+        text.string = lastBatchResults.map{($0["name"] ?? "")+"："+($0["result"] ?? "")}.joined(separator:"\n")
+        let scroll = NSScrollView(frame:NSRect(x:0,y:0,width:480,height:320));scroll.hasVerticalScroller = true;scroll.documentView = text;alert.accessoryView = scroll
+        alert.addButton(withTitle:"关闭");alert.beginSheetModal(for:window)
+    }
     func armDaily() {
+        if isDemo {status.stringValue = "演示模式不启用每日计划。";return}
+        scheduledRoster = roster
         let parts = DailySchedule.calendar.dateComponents([.hour,.minute],from:timePicker.dateValue)
         nextRun = DailySchedule.next(after:Date(),hour:parts.hour!,minute:parts.minute!)
         dailyActive = true;dailySending = false;setEditing(false);stateBadge.stringValue = "● 每日计划已启用";stateBadge.textColor = .systemOrange
         nextLabel.stringValue = "下次：" + DailySchedule.display(nextRun!)
-        status.stringValue = "计划待命。应用需保持运行；停止按钮会取消每日计划。"
+        status.stringValue = "已启用每日整批计划，共\(scheduledRoster.count)位好友；停止按钮可取消。"
         dailyTimer = Timer.scheduledTimer(withTimeInterval:1,repeats:true) { [weak self] _ in self?.checkDaily() }
     }
     func checkDaily() {
@@ -188,21 +306,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         let now = Date();let parts = DailySchedule.calendar.dateComponents([.hour,.minute],from:timePicker.dateValue)
         nextRun = DailySchedule.next(after:now,hour:parts.hour!,minute:parts.minute!)
         nextLabel.stringValue = "下次：" + DailySchedule.display(nextRun!)
-        var ledger = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
-        guard DailySchedule.shouldAttempt(now:now,scheduled:scheduled,previousDay:ledger[targetName]) else {status.stringValue = "今日已尝试或错过执行窗口，等待下次计划。";return}
-        ledger[targetName] = DailySchedule.dayKey(now);prefs.set(ledger,forKey:"dailyAttempts");prefs.synchronize()
-        dailySending = true
-        let selected = targetName
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {finish("抖音未运行，今日计划未发送。");return}
-        NSApp.yieldActivation(to:app);app.activate(options:[.activateAllWindows])
-        let token = generation
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.6) { [weak self] in
-            guard let self = self, self.dailyActive, token == self.generation else {return}
-            self.targetName = selected
-            self.prepareSend()
-        }
+        guard DailySchedule.shouldAttempt(now:now,scheduled:scheduled,previousDay:nil) else {status.stringValue = "错过执行窗口，等待下次整批计划。";return}
+        beginBatch(people:scheduledRoster,dryRun:false)
     }
     func setEditing(_ enabled: Bool) {
+        rosterButton.isEnabled = enabled;batchNowButton.isEnabled = enabled
+        resultsButton.isEnabled = batchRun == nil && !lastBatchResults.isEmpty
         startButton.isEnabled = enabled;stopButton.isEnabled = !enabled;contacts.isEnabled = enabled;refreshButton.isEnabled = enabled
         searchField.isEnabled = enabled;searchButton.isEnabled = enabled;moreButton.isEnabled = enabled
         message.isEditable = enabled;saveButton.isEnabled = enabled;previewButton.isEnabled = enabled;mode.isEnabled = enabled;timePicker.isEnabled = enabled && mode.selectedSegment == 1
@@ -222,6 +331,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         targetName = contacts.titleOfSelectedItem ?? targetName
         prefs.set(targetName,forKey:"recipient"); prefs.set(message.string,forKey:"message")
         prefs.set(interval.stringValue,forKey:"interval"); prefs.set(limit.stringValue,forKey:"count")
+        prefs.set(roster,forKey:"streakRoster")
         prefs.set(mode.selectedSegment,forKey:"mode")
         let clock = DailySchedule.calendar.dateComponents([.hour,.minute],from:timePicker.dateValue)
         prefs.set(clock.hour!,forKey:"dailyHour");prefs.set(clock.minute!,forKey:"dailyMinute")
@@ -236,6 +346,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         return result
     }
     func searchContext()->(NSRunningApplication,AXUIElement,AXUIElement)? {
+        if isDemo {return nil}
         guard AXIsProcessTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {return nil}
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetAttributeValue(root,"AXManualAccessibility" as CFString,kCFBooleanTrue)
@@ -297,28 +408,28 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         return true
     }
     func searchInDouyin(_ query:String,token:Int,completion:@escaping ()->Void) {
-        guard let (original,_,_) = searchContext(),let url = original.bundleURL else {finish("请先授权并打开抖音消息面板。");return}
+        guard let (original,_,_) = searchContext(),let url = original.bundleURL else {finish("请先授权并打开抖音消息面板。",haltBatch:true);return}
         let config = NSWorkspace.OpenConfiguration();config.activates = true;config.addsToRecentItems = false
         NSApp.yieldActivation(to:original)
         NSWorkspace.shared.openApplication(at:url,configuration:config) { [weak self] opened,error in
             DispatchQueue.main.asyncAfter(deadline:.now()+0.4) {
                 guard let self = self,token == self.generation else {return}
-                guard error == nil,let opened = opened,let (app,field,_) = self.searchContext(),app.processIdentifier == opened.processIdentifier else {self.finish("无法打开抖音消息面板。");return}
-                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音已离开前台，停止搜索。");return}
+                guard error == nil,let opened = opened,let (app,field,_) = self.searchContext(),app.processIdentifier == opened.processIdentifier else {self.finish("无法打开抖音消息面板。",haltBatch:true);return}
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音已离开前台，停止搜索。",haltBatch:true);return}
                 guard AXUIElementSetAttributeValue(field,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
-                      AXUIElementPerformAction(field,kAXPressAction as CFString) == .success else {self.finish("无法聚焦抖音搜索框。");return}
+                      AXUIElementPerformAction(field,kAXPressAction as CFString) == .success else {self.finish("无法聚焦抖音搜索框。",haltBatch:true);return}
                 DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in
                     guard let self = self,token == self.generation else {return}
                     let root = AXUIElementCreateApplication(app.processIdentifier)
-                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),(CFEqual(focus,field) || (string(focus as! AXUIElement,"AXRole") == "AXTextField" && string(focus as! AXUIElement,"AXPlaceholderValue") == "搜索")) else {self.finish("搜索框未获得焦点，未输入。");return}
+                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),(CFEqual(focus,field) || (string(focus as! AXUIElement,"AXRole") == "AXTextField" && string(focus as! AXUIElement,"AXPlaceholderValue") == "搜索")) else {self.finish("搜索框未获得焦点，未输入。",haltBatch:true);return}
                     let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true);down?.flags = .maskCommand;down?.postToPid(app.processIdentifier)
                     let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.flags = .maskCommand;up?.postToPid(app.processIdentifier)
                     CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:true)?.postToPid(app.processIdentifier)
                     CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:false)?.postToPid(app.processIdentifier)
-                    guard self.typeText(query,to:app.processIdentifier) else {self.finish("无法输入搜索内容。");return}
+                    guard self.typeText(query,to:app.processIdentifier) else {self.finish("无法输入搜索内容。",haltBatch:true);return}
                     DispatchQueue.main.asyncAfter(deadline:.now()+0.8) { [weak self] in
                         guard let self = self,token == self.generation else {return}
-                        guard let (_,current,_) = self.searchContext(),string(current,"AXValue") == query else {self.finish("搜索内容已变化，请重新搜索。");return}
+                        guard let (_,current,_) = self.searchContext(),string(current,"AXValue") == query else {self.finish("搜索内容已变化，请重新搜索。",haltBatch:true);return}
                         completion()
                     }
                 }
@@ -337,7 +448,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     }
     @objc func loadMore() {
         generation += 1;let token = generation;let old = targetName;setEditing(false)
-        guard let (_,field,scope) = searchContext() else {finish("请先授权并打开抖音消息面板。");return}
+        guard let (_,field,scope) = searchContext() else {finish("请先授权并打开抖音消息面板。",haltBatch:true);return}
         if !string(field,"AXValue").isEmpty {
             if let cancel = dfs(scope).first(where:{string($0,"AXRole") == "AXStaticText" && string($0,"AXValue") == "取消"}),let parent = attribute(cancel,"AXParent") {
                 AXUIElementPerformAction(parent as! AXUIElement,kAXPressAction as CFString)
@@ -366,26 +477,39 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
             DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { [weak self] in guard self?.generation == token else {return};then() }
         }
     }
-    func finish(_ result: String) {
+    func finish(_ result:String,outcome:BatchOutcome? = nil,haltBatch:Bool = false) {
         generation += 1;flow = nil;pendingSince = nil;timer?.invalidate();timer = nil;awaitingConfirmation = false;dailySending = false
+        if var run = batchRun {
+            run.complete(outcome ?? .failed(result))
+            if haltBatch {run.cancel()}
+            batchRun = run;storeBatchResults(run.results)
+            if run.finished {endBatch();return}
+            let token = generation
+            status.stringValue = "已处理\(run.results.count)/\(run.people.count)，稍后继续下一位。"
+            DispatchQueue.main.asyncAfter(deadline:.now()+2) { [weak self] in guard let self = self,self.generation == token,self.batchRun != nil else {return};self.advanceBatch() }
+            return
+        }
         setEditing(!dailyActive)
         stateBadge.stringValue = dailyActive ? "● 每日计划待命" : "● 已停止"
-        stateBadge.textColor = dailyActive ? .systemOrange : .secondaryLabelColor
-        status.stringValue = result
+        stateBadge.textColor = dailyActive ? .systemOrange : .secondaryLabelColor;status.stringValue = result
     }
     @objc func stopClicked() {
         dailyActive = false;dailyTimer?.invalidate();dailyTimer = nil;nextRun = nil;nextLabel.stringValue = "每日计划已停止"
-        finish("已手动停止。")
+        if var run = batchRun {run.cancel();storeBatchResults(run.results);batchRun = nil;restoreBatchSelection()}
+        finish("已手动停止，未执行的好友不会继续发送。")
     }
     @objc func start() {
-        guard AXIsProcessTrusted() else {requestAccessibility(); return}
+        if isDemo {status.stringValue = "演示模式不发送消息。";return}
+        guard AXIsProcessTrusted() else {requestAccessibility();return}
+        guard MessageRules.valid(message.string) else {status.stringValue = "请输入有效的单行消息。";return}
+        sendText = message.string;saveSettings()
+        if mode.selectedSegment == 1 {
+            guard !roster.isEmpty else {status.stringValue = "请先点击选择好友名单，并勾选至少一位好友。";return}
+            armDaily();return
+        }
+        guard SendRate.parse(interval.stringValue) != nil,let count = Int(limit.stringValue),(1...100000).contains(count) else {status.stringValue = "间隔至少0.1秒，总次数为1到100000。";return}
         targetName = contacts.titleOfSelectedItem ?? ""
-        let text = message.string
-        guard MessageRules.valid(text) else {status.stringValue = "请输入 1 到 1000 个 UTF-16 字符的单行消息，不含制表等控制字符。";return}
-        guard mode.selectedSegment == 1 || (SendRate.parse(interval.stringValue) != nil && (Int(limit.stringValue).map{(1...100000).contains($0)} ?? false)) else {status.stringValue = "间隔至少0.1秒，总次数为1到100000。";return}
-        sendText = text; saveSettings()
-        guard targetName != "请选择会话", !targetName.isEmpty, knownNames.contains(targetName) else {status.stringValue = "请先刷新并选择唯一的会话。";return}
-        if mode.selectedSegment == 1 && !previewOnly {armDaily();return}
+        guard targetName != "请选择会话",!targetName.isEmpty,knownNames.contains(targetName) else {status.stringValue = "请先刷新并选择唯一的会话。";return}
         prepareSend()
     }
     func prepareSend() {
@@ -405,11 +529,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         guard let seconds = (mode.selectedSegment == 1 ? 1 : SendRate.parse(interval.stringValue)) else {finish("请输入至少0.1秒的发送间隔。");return}
         guard let count = (mode.selectedSegment == 1 ? 1 : Int(limit.stringValue)), (1...100000).contains(count) else {finish("总次数应为1到100000。");return}
         guard AXIsProcessTrusted() else {
-            status.stringValue = "尚无辅助功能权限。请在系统设置 > 隐私与安全性 > 辅助功能中允许此控制器，之后重新打开。"
+            finish("尚无辅助功能权限，请重新授权。",haltBatch:true)
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String:true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options); return
         }
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {status.stringValue = "请先打开并登录抖音。"; return}
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {finish("请先打开并登录抖音。",haltBatch:true);return}
         let root = AXUIElementCreateApplication(app.processIdentifier)
         let editors = walk(root).filter {string($0,"AXRole") == "AXTextArea"}
         guard editors.count == 1 else {finish("请在抖音打开指定会话，并点一下消息输入框。");return}
@@ -442,7 +566,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         guard let scope = scope, let header = header, clean(string(header,"AXValue")) == targetName else {finish("当前会话与所选收件人不一致，未启动。请刷新重试。"); return}
         boundHeader = header
         editor = input; chat = scope; pid = app.processIdentifier; total = dailySending ? 1 : count; sent = 0; awaitingConfirmation = false
-        if preview {finish("预检通过：已定位所选会话，未输入、未发送消息。");return}
+        if preview {finish("预检通过：已定位所选会话，未输入、未发送消息。",outcome:.verified);return}
         lastInspection = Date.distantPast;pendingSince = nil
         progress.stringValue = "已发送：0 / \(total)"
         startButton.isEnabled = false; stopButton.isEnabled = true; interval.isEnabled = false; limit.isEnabled = false; contacts.isEnabled = false; refreshButton.isEnabled = false; message.isEditable = false; saveButton.isEnabled = false
@@ -456,28 +580,28 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     func isEmpty(_ e:AXUIElement)->Bool {MessageRules.emptyEditor(string(e,"AXValue"))}
     func tick() {
         guard let input = editor,let scope = chat,var state = flow else {finish("输入框失效，已停止。");return}
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {finish("已切换应用，自动停止。");return}
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {finish("已切换应用，自动停止。",haltBatch:true);return}
         let root = AXUIElementCreateApplication(pid)
-        guard let focused = attribute(root,"AXFocusedUIElement"),CFEqual(focused,input),let header = boundHeader,clean(string(header,"AXValue")) == targetName else {finish("输入焦点或会话变化，自动停止。");return}
+        guard let focused = attribute(root,"AXFocusedUIElement"),CFEqual(focused,input),let header = boundHeader,clean(string(header,"AXValue")) == targetName else {finish("输入焦点或会话变化，自动停止。",haltBatch:true);return}
         let now = Date()
         if now.timeIntervalSince(lastInspection) >= 1 {
             lastInspection = now
             let problem = walk(scope,maxNodes:1000).contains { node in
                 MessageRules.failureIndicator(role:string(node,"AXRole"),label:string(node,"AXTitle")+string(node,"AXDescription")+string(node,"AXValue"))
             }
-            guard !problem else {finish("检测到发送异常或平台限制，已停止。");return}
+            guard !problem else {finish("检测到发送异常或平台限制，已停止。",haltBatch:true);return}
         }
         let action = state.step(now:ProcessInfo.processInfo.systemUptime,editor:string(input,"AXValue"));flow = state;sent = state.sent
         switch action {
         case .type:
-            guard typeText(sendText,to:pid) else {finish("无法输入消息，已停止。");return}
+            guard typeText(sendText,to:pid) else {finish("无法输入消息，已停止。",haltBatch:true);return}
         case .enter:
             CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true)?.postToPid(pid)
             CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false)?.postToPid(pid)
         case .confirmed: progress.stringValue = "界面发送操作：\(sent) / \(total)"
         case .complete:
-            progress.stringValue = "界面发送操作：\(sent) / \(total)";finish("已完成\(sent)次界面发送操作，不代表对方已收取。")
-        case .failed(let reason): finish(reason)
+            progress.stringValue = "界面发送操作：\(sent) / \(total)";finish("已完成\(sent)次界面发送操作，不代表对方已收取。",outcome:.sent)
+        case .failed(let reason): finish(reason,haltBatch:true)
         case .wait: break
         }
     }
@@ -485,7 +609,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     func windowWillClose(_ notification: Notification) {NSApp.terminate(nil)}
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {true}
 }
-let lockPath = NSTemporaryDirectory() + (CommandLine.arguments.contains("--check-layout") ? "douyin-message-assistant-layout.lock" : "douyin-message-assistant.lock")
+let lockPath = NSTemporaryDirectory() + (CommandLine.arguments.contains("--check-layout") ? "douyin-message-assistant-layout.lock" : (CommandLine.arguments.contains("--demo") ? "douyin-message-assistant-demo.lock" : "douyin-message-assistant.lock"))
 let lockFD = Darwin.open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
 if lockFD < 0 || flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
     exit(0)
