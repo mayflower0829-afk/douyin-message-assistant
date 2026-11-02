@@ -297,9 +297,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     func searchInDouyin(_ query:String,token:Int,completion:@escaping ()->Void) {
         guard let (app,field,_) = searchContext(),let position = point(field) else {finish("请先授权并打开抖音消息面板。");return}
         NSApp.yieldActivation(to:app);app.activate(options:[.activateAllWindows])
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.3) { [weak self] in
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        if let window = (attribute(root,"AXWindows") as? [AXUIElement])?.first {AXUIElementPerformAction(window,kAXRaiseAction as CFString)}
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
             guard let self = self,token == self.generation else {return}
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音未切到前台，请先打开抖音。");return}
+            var hit:AXUIElement?
+            var hitPID:pid_t = 0
+            let result = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),Float(position.x),Float(position.y),&hit)
+            if let element = hit {AXUIElementGetPid(element,&hitPID)}
+            guard result == .success,hitPID == app.processIdentifier else {self.finish("抖音搜索框被遮挡，请先打开抖音窗口。");return}
             self.clickPoint(position)
             DispatchQueue.main.asyncAfter(deadline:.now()+0.15) { [weak self] in
                 guard let self = self,token == self.generation else {return}
