@@ -3,24 +3,6 @@ import ApplicationServices
 
 
 let bundleID = "com.bytedance.douyin.desktop"
-func attribute(_ e: AXUIElement, _ key: String) -> CFTypeRef? {
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(e, key as CFString, &value) == .success else { return nil }
-    return value
-}
-func string(_ e: AXUIElement, _ key: String) -> String { attribute(e,key) as? String ?? "" }
-func children(_ e: AXUIElement) -> [AXUIElement] { attribute(e,"AXChildren") as? [AXUIElement] ?? [] }
-func walk(_ root: AXUIElement, maxNodes: Int = 5000) -> [AXUIElement] {
-    var queue = [root], result = [AXUIElement](), i = 0
-    while i < queue.count && i < maxNodes {
-        let e = queue[i]; i += 1; result.append(e); queue.append(contentsOf: children(e))
-    }
-    return result
-}
-func clean(_ s: String) -> String {
-    s.replacingOccurrences(of:"\u{200B}",with:"").trimmingCharacters(in:.whitespacesAndNewlines)
-}
-
 final class FlippedListView:NSView {override var isFlipped:Bool {true}}
 
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
@@ -41,6 +23,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     let moreButton = NSButton(title:"加载更多",target:nil,action:nil)
     var knownNames = [String]()
     var flow: SendFlow?
+    var expectedAvatarKey = "", boundAvatar:AXUIElement?
+    var submittedCurrent = false, reservedCurrent:String?, reservedDay:String?
+    var resultSubmission = [String:Bool]()
 
     let isPreview = CommandLine.arguments.contains("--check-layout")
     let isDemo = CommandLine.arguments.contains("--demo")
@@ -64,6 +49,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     let permissionButton = NSButton(title:"授权辅助功能",target:nil,action:nil)
     var contactElements: [String: [AXUIElement]] = [:]
     var contactOpeners = [String:AXUIElement]()
+    var contactAvatars = [String:[String]]()
     var sendText = "？"
     let prefs = CommandLine.arguments.contains("--demo") ? UserDefaults(suiteName:"local.douyin.messageassistant.demo")! : UserDefaults.standard
     let interval = NSTextField(string:"0.5")
@@ -80,6 +66,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         if isDemo {prefs.register(defaults:["mode":1])}
         roster = BatchRun.roster(prefs.stringArray(forKey:"streakRoster") ?? [])
         lastBatchResults = prefs.array(forKey:"batchResults") as? [[String:String]] ?? []
+        repairUnsentAttempts()
         prefs.register(defaults:["recipient":"请选择会话","message":"？","interval":"0.5","count":"1"])
         targetName = prefs.string(forKey:"recipient") ?? "请选择会话"
         interval.stringValue = prefs.string(forKey:"interval") ?? "0.5"
@@ -247,23 +234,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         guard MessageRules.valid(message.string) else {status.stringValue = "请先设置有效的单行消息。";return}
         guard searchContext() != nil else {status.stringValue = "请先在抖音打开消息面板。";return}
         sendText = message.string;saveSettings();batchOriginalSelection = contacts.titleOfSelectedItem ?? "请选择会话"
-        batchRun = BatchRun(people:people,dryRun:dryRun);lastBatchResults = [];generation += 1;setEditing(false)
+        batchRun = BatchRun(people:people,dryRun:dryRun);lastBatchResults = [];resultSubmission = [:];generation += 1;setEditing(false)
         advanceBatch()
     }
     func advanceBatch() {
         guard var run = batchRun,run.current == nil else {return}
-        var attempts = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
+        let attempts = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
         let day = DailySchedule.dayKey(Date())
         let person = run.next(day:day,attempts:attempts);batchRun = run
         guard let person = person else {if run.finished {endBatch()};return}
-        if !run.dryRun {attempts[person] = day;prefs.set(attempts,forKey:"dailyAttempts");prefs.synchronize()}
+        submittedCurrent = false;reservedCurrent = nil;reservedDay = nil;expectedAvatarKey = ""
         targetName = person;dailySending = true
         stateBadge.stringValue = run.dryRun ? "● 批量预检中" : "● 一键续火花执行中"
         progress.stringValue = "已处理 \(run.results.count) / \(run.people.count) · 当前：\(person)"
         previewOnly = run.dryRun;prepareSend();previewOnly = false
     }
     func storeBatchResults(_ values:[BatchResult]) {
-        lastBatchResults = values.map{["name":$0.name,"result":$0.outcome.text]}
+        lastBatchResults = values.map{["name":$0.name,"result":$0.outcome.text,"mayHaveSubmitted":String(resultSubmission[$0.name] ?? ($0.outcome == .sent))]}
         prefs.set(lastBatchResults,forKey:"batchResults");prefs.synchronize()
     }
     func restoreBatchSelection() {
@@ -357,11 +344,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         return (app,fields[0],scope)
     }
     @discardableResult func collectContacts(preserving previous:String? = nil)->Bool {
-        contactElements.removeAll();contactOpeners.removeAll()
+        contactElements.removeAll();contactOpeners.removeAll();contactAvatars.removeAll()
         guard let (_,_,scope) = searchContext() else {status.stringValue = AXIsProcessTrusted() ? "请先在抖音打开消息面板。" : "请先点击连接授权。";return false}
-        var lastName:String?;var nextIsName = false;var found = [String:[AXUIElement]]();var order = [String]()
+        var lastAvatar = "";var lastName:String?;var nextIsName = false;var found = [String:[AXUIElement]]();var order = [String]()
         for node in dfs(scope) {
-            if string(node,"AXRole") == "AXImage", !string(node,"AXDescription").isEmpty {nextIsName = true}
+            if string(node,"AXRole") == "AXImage", !string(node,"AXDescription").isEmpty {nextIsName = true;lastAvatar = ChatIdentity.avatarKey(string(node,"AXDescription"))}
             else if nextIsName, string(node,"AXRole") == "AXStaticText" {
                 nextIsName = false
                 let nameNode = attribute(node,"AXParent").map{$0 as! AXUIElement} ?? node
@@ -369,7 +356,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
                 let name = MessageRules.contactName(parts)
                 guard !name.isEmpty else {continue}
                 if found[name] == nil {order.append(name)}
-                found[name,default:[]].append(nameNode);lastName = name
+                found[name,default:[]].append(nameNode);contactAvatars[name,default:[]].append(lastAvatar);lastName = name
             } else if string(node,"AXRole") == "AXStaticText",string(node,"AXValue") == "发消息",let name = lastName {
                 contactOpeners[name] = attribute(node,"AXParent").map{$0 as! AXUIElement} ?? node
             }
@@ -467,19 +454,58 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     }
     func openSelected(_ then:@escaping ()->Void) {
         let name = targetName;let token = generation
-        searchInDouyin(name,token:token) { [weak self] in
-            guard let self = self else {return}
-            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleID,self.collectContacts(preserving:name),let matches = self.contactElements[name],matches.count == 1,let position = self.point(self.contactOpeners[name] ?? matches[0]) else {self.targetName = name;self.finish("未找到唯一匹配的联系人，未发送。请搜索并核实同名会话。");return}
-            self.targetName = name
-            if let opener = self.contactOpeners[name] {
-                guard AXUIElementPerformAction(opener,kAXPressAction as CFString) == .success else {self.finish("无法打开所选会话。");return}
-            } else {self.clickPoint(position)}
-            DispatchQueue.main.asyncAfter(deadline:.now()+0.4) { [weak self] in guard self?.generation == token else {return};then() }
+        searchInDouyin(name,token:token) { [weak self] in self?.waitForSearch(name:name,token:token,deadline:Date().addingTimeInterval(5),then:then) }
+    }
+    func waitForSearch(name:String,token:Int,deadline:Date,then:@escaping ()->Void) {
+        guard token == generation else {return}
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleID else {finish("抖音已离开前台，停止查找。",haltBatch:true);return}
+        _ = collectContacts(preserving:name)
+        let matches = contactElements[name] ?? []
+        if matches.count > 1 {targetName = name;finish("同名联系人不唯一，未发送。请核实名单。");return}
+        if matches.count == 1,let key = contactAvatars[name]?.first,!key.isEmpty {
+            targetName = name;expectedAvatarKey = key
+            let actionTarget = contactOpeners[name] ?? matches[0]
+            guard AXUIElementPerformAction(actionTarget,kAXPressAction as CFString) == .success else {finish("无法打开所选会话，未发送。");return}
+            waitForChat(name:name,token:token,deadline:Date().addingTimeInterval(5),then:then);return
         }
+        if Date() >= deadline {targetName = name;finish("未找到唯一匹配的联系人，未发送。请搜索并核实同名会话。");return}
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.25) { [weak self] in self?.waitForSearch(name:name,token:token,deadline:deadline,then:then) }
+    }
+    func waitForChat(name:String,token:Int,deadline:Date,then:@escaping ()->Void) {
+        guard token == generation else {return}
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first,
+           findChatBinding(root:AXUIElementCreateApplication(app.processIdentifier),name:name,avatarKey:expectedAvatarKey) != nil {then();return}
+        if Date() >= deadline {finish("尚未确认所选会话标题和头像，未发送。");return}
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in self?.waitForChat(name:name,token:token,deadline:deadline,then:then) }
+    }
+    func repairUnsentAttempts() {
+        let attempts = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
+        let phases = prefs.dictionary(forKey:"attemptPhases") as? [String:[String:String]] ?? [:]
+        let results = prefs.array(forKey:"batchResults") as? [[String:String]] ?? []
+        let repaired = AttemptRules.recover(attempts:attempts,phases:phases,results:results)
+        prefs.set(repaired.0,forKey:"dailyAttempts");prefs.set(repaired.1,forKey:"attemptPhases");prefs.synchronize()
+    }
+    @discardableResult
+    func markAttempt(_ phase:String)->Bool {
+        guard let run = batchRun,!run.dryRun,let name = run.current else {return true}
+        let day = reservedDay ?? DailySchedule.dayKey(Date());reservedDay = day;reservedCurrent = name
+        var attempts = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
+        var phases = prefs.dictionary(forKey:"attemptPhases") as? [String:[String:String]] ?? [:]
+        attempts[name] = day;phases[name] = ["day":day,"phase":phase]
+        prefs.set(attempts,forKey:"dailyAttempts");prefs.set(phases,forKey:"attemptPhases");return prefs.synchronize()
+    }
+    func releaseUnsubmittedAttempt() {
+        guard !submittedCurrent,let name = reservedCurrent,let day = reservedDay else {return}
+        var attempts = prefs.dictionary(forKey:"dailyAttempts") as? [String:String] ?? [:]
+        var phases = prefs.dictionary(forKey:"attemptPhases") as? [String:[String:String]] ?? [:]
+        if attempts[name] == day && phases[name]?["phase"] == "typing" {attempts.removeValue(forKey:name);phases.removeValue(forKey:name)}
+        prefs.set(attempts,forKey:"dailyAttempts");prefs.set(phases,forKey:"attemptPhases");prefs.synchronize();reservedCurrent = nil;reservedDay = nil
     }
     func finish(_ result:String,outcome:BatchOutcome? = nil,haltBatch:Bool = false) {
         generation += 1;flow = nil;pendingSince = nil;timer?.invalidate();timer = nil;awaitingConfirmation = false;dailySending = false
         if var run = batchRun {
+            if let name = run.current {resultSubmission[name] = submittedCurrent}
+            releaseUnsubmittedAttempt()
             run.complete(outcome ?? .failed(result))
             if haltBatch {run.cancel()}
             batchRun = run;storeBatchResults(run.results)
@@ -495,7 +521,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
     }
     @objc func stopClicked() {
         dailyActive = false;dailyTimer?.invalidate();dailyTimer = nil;nextRun = nil;nextLabel.stringValue = "每日计划已停止"
-        if var run = batchRun {run.cancel();storeBatchResults(run.results);batchRun = nil;restoreBatchSelection()}
+        if var run = batchRun {if let name = run.current {resultSubmission[name] = submittedCurrent};releaseUnsubmittedAttempt();run.cancel();storeBatchResults(run.results);batchRun = nil;restoreBatchSelection()}
         finish("已手动停止，未执行的好友不会继续发送。")
     }
     @objc func start() {
@@ -521,7 +547,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
             guard let self = self, self.generation == token else {return}
             self.bindAndStart(preview:preview)
         }
-        DispatchQueue.main.asyncAfter(deadline:.now()+8) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline:.now()+15) { [weak self] in
             if let self = self, self.generation == token, self.timer == nil {self.finish("准备超时，未发送。请检查抖音是否在前台。")}
         }
     }
@@ -535,37 +561,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         }
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier:bundleID).first else {finish("请先打开并登录抖音。",haltBatch:true);return}
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        let editors = walk(root).filter {string($0,"AXRole") == "AXTextArea"}
-        guard editors.count == 1 else {finish("请在抖音打开指定会话，并点一下消息输入框。");return}
-        let input = editors[0]
+        guard let binding = findChatBinding(root:root,name:targetName,avatarKey:expectedAvatarKey) else {finish("尚未确认所选会话标题和头像，未发送。");return}
+        let input = binding.input
         guard isEmpty(input) else {finish("输入框中已有内容，请先清空后再开始。");return}
-        var ancestor = input; var scope: AXUIElement?; var header: AXUIElement?
-        for _ in 0..<7 {
-            guard let parent = attribute(ancestor,"AXParent") else {break}
-            ancestor = parent as! AXUIElement
-            let scopeNodes = walk(ancestor,maxNodes:1500)
-            if scopeNodes.contains(where:{string($0,"AXRole") == "AXTextField"}) {break}
-            for child in children(ancestor) {
-                let nodes = walk(child,maxNodes:25)
-                if nodes.contains(where:{CFEqual($0,input)}) {continue}
-                // The header may also contain unread count and a Follow label.
-                // Only inspect a complete small sibling, never a truncated history subtree.
-                if nodes.count >= 25 {continue}
-                for part in nodes {
-                    let leafNodes = walk(part,maxNodes:20)
-                    let texts = leafNodes.filter{string($0,"AXRole") == "AXStaticText"}
-                    let avatars = leafNodes.filter{string($0,"AXRole") == "AXImage" && !string($0,"AXDescription").isEmpty}
-                    if texts.count == 1 && avatars.count == 1 && leafNodes.count < 20 {
-                        header = texts[0]; scope = ancestor; break
-                    }
-                }
-                if scope != nil {break}
-            }
-            if scope != nil {break}
-        }
-        guard let scope = scope, let header = header, clean(string(header,"AXValue")) == targetName else {finish("当前会话与所选收件人不一致，未启动。请刷新重试。"); return}
-        boundHeader = header
-        editor = input; chat = scope; pid = app.processIdentifier; total = dailySending ? 1 : count; sent = 0; awaitingConfirmation = false
+        boundHeader = binding.header;boundAvatar = binding.avatar
+        editor = input;chat = binding.scope;pid = app.processIdentifier;total = dailySending ? 1 : count;sent = 0;awaitingConfirmation = false
         if preview {finish("预检通过：已定位所选会话，未输入、未发送消息。",outcome:.verified);return}
         lastInspection = Date.distantPast;pendingSince = nil
         progress.stringValue = "已发送：0 / \(total)"
@@ -582,7 +582,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         guard let input = editor,let scope = chat,var state = flow else {finish("输入框失效，已停止。");return}
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {finish("已切换应用，自动停止。",haltBatch:true);return}
         let root = AXUIElementCreateApplication(pid)
-        guard let focused = attribute(root,"AXFocusedUIElement"),CFEqual(focused,input),let header = boundHeader,clean(string(header,"AXValue")) == targetName else {finish("输入焦点或会话变化，自动停止。",haltBatch:true);return}
+        guard let focused = attribute(root,"AXFocusedUIElement"),CFEqual(focused,input),let header = boundHeader,clean(string(header,"AXValue")) == targetName,let avatar = boundAvatar,ChatIdentity.avatarKey(string(avatar,"AXDescription")) == expectedAvatarKey else {finish("输入焦点或会话变化，自动停止。",haltBatch:true);return}
         let now = Date()
         if now.timeIntervalSince(lastInspection) >= 1 {
             lastInspection = now
@@ -594,12 +594,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         let action = state.step(now:ProcessInfo.processInfo.systemUptime,editor:string(input,"AXValue"));flow = state;sent = state.sent
         switch action {
         case .type:
+            guard markAttempt("typing") else {finish("无法保存发送状态，未发送。",haltBatch:true);return}
             guard typeText(sendText,to:pid) else {finish("无法输入消息，已停止。",haltBatch:true);return}
         case .enter:
-            CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true)?.postToPid(pid)
-            CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false)?.postToPid(pid)
+            guard let down = CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:true),let up = CGEvent(keyboardEventSource:nil,virtualKey:36,keyDown:false),markAttempt("submitted") else {finish("无法保存或创建发送操作，未按回车。",haltBatch:true);return}
+            submittedCurrent = true;down.flags = [];up.flags = [];down.postToPid(pid);up.postToPid(pid)
         case .confirmed: progress.stringValue = "界面发送操作：\(sent) / \(total)"
         case .complete:
+            markAttempt("cleared")
             progress.stringValue = "界面发送操作：\(sent) / \(total)";finish("已完成\(sent)次界面发送操作，不代表对方已收取。",outcome:.sent)
         case .failed(let reason): finish(reason,haltBatch:true)
         case .wait: break

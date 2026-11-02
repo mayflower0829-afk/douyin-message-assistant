@@ -85,3 +85,22 @@ check(restarted.next(day:day,attempts:ledger) == nil && restarted.finished,"save
 check(BatchRun(people:[],dryRun:false).finished,"empty roster never schedules a job")
 
 check(BatchRun.roster(["甲","含\n换行"]) == ["甲"],"rejects control characters in recipient names")
+
+let identityKey = ChatIdentity.avatarKey("/avatar-id~resize.webp?token=example")
+check(identityKey == "avatar-id","avatar identity ignores crop and transient query")
+check(ChatIdentity.matches(name:"甲",avatar:identityKey,texts:["21","甲","重燃中 1/3"],avatars:["/avatar-id~other.webp?x=2"],height:60),"fire count does not invalidate the correct chat header")
+check(!ChatIdentity.matches(name:"甲",avatar:identityKey,texts:["甲"],avatars:["/different-id"],height:60),"same nickname with different avatar is rejected")
+check(!ChatIdentity.matches(name:"甲",avatar:identityKey,texts:["甲"],avatars:["/avatar-id"],height:500),"history region cannot masquerade as a header")
+check(!ChatIdentity.matches(name:"甲",avatar:identityKey,texts:["甲乙"],avatars:["/avatar-id"],height:60),"header requires exact nickname")
+let failedBefore = [["name":"甲","result":"失败：当前会话与所选收件人不一致，未启动。请刷新重试。"]]
+let repairedLegacy = AttemptRules.recover(attempts:["甲":day,"乙":day],phases:[:],results:failedBefore)
+check(repairedLegacy.0["甲"] == nil && repairedLegacy.0["乙"] == day,"only provably unsent legacy attempts are released")
+for phase in ["submitted","cleared"] {
+    let preserved = AttemptRules.recover(attempts:["甲":day],phases:["甲":["day":day,"phase":phase]],results:failedBefore)
+    check(preserved.0["甲"] == day,"new submission state overrides stale old failure: \(phase)")
+}
+let releasedTyping = AttemptRules.recover(attempts:["甲":day],phases:["甲":["day":day,"phase":"typing"]],results:[])
+check(releasedTyping.0.isEmpty && releasedTyping.1.isEmpty,"restart releases typing that never reached Enter")
+let unknown = AttemptRules.recover(attempts:["甲":day],phases:[:],results:[["name":"甲","result":"今日已尝试，跳过"]])
+check(unknown.0["甲"] == day,"unknown old attempts are never silently cleared")
+check(!AttemptRules.provesNoSubmission("失败：发送后输入框未清空"),"possible submitted messages stay blocked")
