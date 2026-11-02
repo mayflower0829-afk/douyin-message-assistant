@@ -107,6 +107,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         }
         contacts.widthAnchor.constraint(equalToConstant:400).isActive = true;contacts.target = self;contacts.action = #selector(selectionChanged)
         refreshButton.target = self;refreshButton.action = #selector(refreshContacts)
+        searchField.sendsWholeSearchString = true
         searchField.placeholderString = "输入昵称，搜索列表外的联系人";searchField.widthAnchor.constraint(equalToConstant:350).isActive = true
         searchField.target = self;searchField.action = #selector(searchContacts)
         searchButton.target = self;searchButton.action = #selector(searchContacts)
@@ -302,13 +303,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTex
         NSWorkspace.shared.openApplication(at:url,configuration:config) { [weak self] opened,error in
             DispatchQueue.main.asyncAfter(deadline:.now()+0.4) {
                 guard let self = self,token == self.generation else {return}
-                guard error == nil,let opened = opened,let (app,field,_) = self.searchContext(),app.processIdentifier == opened.processIdentifier,let position = self.point(field) else {self.finish("无法打开抖音消息面板。");return}
+                guard error == nil,let opened = opened,let (app,field,_) = self.searchContext(),app.processIdentifier == opened.processIdentifier else {self.finish("无法打开抖音消息面板。");return}
                 guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {self.finish("抖音已离开前台，停止搜索。");return}
-                self.clickPoint(position)
+                guard AXUIElementSetAttributeValue(field,kAXFocusedAttribute as CFString,kCFBooleanTrue) == .success,
+                      AXUIElementPerformAction(field,kAXPressAction as CFString) == .success else {self.finish("无法聚焦抖音搜索框。");return}
                 DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in
                     guard let self = self,token == self.generation else {return}
                     let root = AXUIElementCreateApplication(app.processIdentifier)
-                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),CFEqual(focus,field) else {self.finish("搜索框未获得焦点，未输入。");return}
+                    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,let focus = attribute(root,"AXFocusedUIElement"),(CFEqual(focus,field) || (string(focus as! AXUIElement,"AXRole") == "AXTextField" && string(focus as! AXUIElement,"AXPlaceholderValue") == "搜索")) else {self.finish("搜索框未获得焦点，未输入。");return}
                     let down = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true);down?.flags = .maskCommand;down?.postToPid(app.processIdentifier)
                     let up = CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.flags = .maskCommand;up?.postToPid(app.processIdentifier)
                     CGEvent(keyboardEventSource:nil,virtualKey:51,keyDown:true)?.postToPid(app.processIdentifier)
