@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+dist/
+*.app/
+*.zip
+.env*
+!.env.example
+*cookie*
+*storage-state*
+*.log
+*.plist
+state/
+config.local.*
